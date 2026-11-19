@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.jackrubiralta.night-mode",
+  "name": "Night Mode",
+  "version": "1.0.0",
+  "author": "Jack Rubiralta",
+  "license": "MIT",
+  "description": "One click dims every screen to the same real brightness in cd/m², read from each screen's EDID, plus the keyboard backlight. A second click restores everything.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Night Mode",
+    "description": "Dim every screen to the same real brightness, and the keyboard backlight.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "centerEnd",
+    "defaults": {
+      "brightness": 0,
+      "keyboard": "dim"
+    },
+    "schema": [
+      {
+        "key": "brightness",
+        "type": "integer",
+        "label": "Night brightness in cd/m² (0 = as dim as every screen can go)",
+        "min": 0,
+        "max": 300,
+        "step": 1,
+        "defaultValue": 0
+      },
+      {
+        "key": "keyboard",
+        "type": "enum",
+        "label": "Keyboard backlight",
+        "options": [
+          { "value": "dim", "label": "Dim" },
+          { "value": "off", "label": "Off" },
+          { "value": "unchanged", "label": "Leave unchanged" }
+        ],
+        "defaultValue": "dim"
+      }
+    ]
+  }
+}
