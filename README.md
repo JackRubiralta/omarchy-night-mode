@@ -41,6 +41,10 @@ omarchy plugin remove io.github.jackrubiralta.night-mode
 
 The moon is full strength while night mode is on and dimmed while it is off.
 
+**Your own brightness comes back.** Turning night mode on saves the exact level of every screen and the keyboard first; turning it off puts those levels back, even if you pressed the brightness keys in between, and even after a reboot. Night Mode reads each level back to check it took, and tries again if a monitor missed the command. If a monitor still won't take it, the moon stays lit and the next click tries again; the saved level is kept until it goes back, so it is never lost.
+
+**Night mode only ever dims.** A screen that is already darker than the night level stays where it is, and turning night mode off leaves it there too. The same goes for a screen you dim further by hand while night mode is on, and for a keyboard that is already dim or unlit.
+
 Plug a monitor in while night mode is on and it dims to match within a few seconds. Unplug one while night mode is on, turn night mode off, and that monitor gets its own brightness back the next time you plug it in.
 
 The same script runs from a terminal or a keybinding. Link it onto your `PATH` once:
@@ -116,7 +120,9 @@ A screen that reports none of them is taken as a typical 300 cd/m² laptop panel
 
 **The target.** Left on automatic, the target is the light the least-dimmable screen gives at 1 %, Omarchy's lowest brightness step. Every screen can reach that, so they all match. Night Mode remembers each screen it has dimmed, so the target stays the same when that screen is unplugged: the laptop alone still dims to the level that matches the monitor. `night-mode forget` clears that memory.
 
-**Calibrating.** The EDID figures are the maker's, and the 5 % floor is an estimate. If two screens don't look the same at night, run `night-mode calibrate` (or right-click the moon). It turns night mode on and lets you raise or lower each screen with the arrow keys until it matches the reference screen; Enter saves. The correction belongs to that monitor model on any port.
+**Each screen's night level** is the lower of the matched level and the level the screen had when night mode turned on, so a screen that was already darker keeps its own level.
+
+**Calibrating.** The EDID figures are the maker's, and the 5 % floor is an estimate. If two screens don't look the same at night, run `night-mode calibrate` (or right-click the moon). It turns night mode on and lets you raise or lower each screen with the arrow keys until it matches the reference screen; Enter saves. The correction belongs to that monitor model on any port. A screen can't be calibrated brighter than the level you had it at.
 
 ## Files
 
@@ -138,7 +144,7 @@ Nothing runs in the background. The widget follows `state.json` and calls the sc
 ## Development
 
 ```bash
-tests/run.sh                           # 48 tests on a fake /sys with mock tools
+tests/run.sh                           # 69 tests on a fake /sys with mock tools
 shellcheck bin/night-mode tests/run.sh
 omarchy plugin validate .
 ```

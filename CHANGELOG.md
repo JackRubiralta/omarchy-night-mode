@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0 – 2026-11-19
+
+- **Night mode only ever dims.** Each screen goes to the lower of the matched night level and its own level, so a screen already darker than the night level stays where it is. A screen dimmed further by hand while night mode is on is not raised again when the night level changes (a monitor plugged in, a new setting). The keyboard is never brightened either.
+- **Restores are checked.** Every level night mode sets or puts back is read back and retried up to three times, since a monitor can miss a DDC/CI command and Omarchy's brightness command skips a run while another holds its lock. A screen that still misses its original level keeps it saved: the moon stays lit so the next click tries again, and after a second miss the saved level waits for the monitor's next replug or the next on/off.
+- `night-mode off` always retries saved levels, even when night mode is already off.
+- `info` says when a screen keeps its own, darker level; `info --json` adds `matchedLevel` and `keepsOwnLevel`.
+- Calibration skips a screen that was already darker and never goes above your own level.
+
 ## 1.0.0 – 2026-11-19
 
 First public release.

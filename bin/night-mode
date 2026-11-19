@@ -13,7 +13,7 @@
 set -uo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly PLUGIN_ID="io.github.jackrubiralta.night-mode"
 
 SYSFS="${NIGHT_MODE_SYSFS:-/sys}"
@@ -299,10 +299,12 @@ wait_brightness_lock() {
   return 0
 }
 
+warn() { echo "night-mode: $*" >&2; }
+
 get_level() {
-  local c=$1 kind=${2:-${D_KIND[$1]}} v
+  local c=$1 kind=${2:-${D_KIND[$1]}} dev=${3:-${D_DEV[$1]:-}} v
   if [[ $kind == backlight ]]; then
-    v=$(<"$SYSFS/class/backlight/${D_DEV[$c]}/brightness") || return 1
+    v=$(<"$SYSFS/class/backlight/$dev/brightness") || return 1
   else
     have omarchy-brightness-display || return 1
     wait_brightness_lock
@@ -321,6 +323,37 @@ set_level() {
     omarchy-brightness-display --no-osd --monitor "$c" "${level}%" >/dev/null 2>&1
   fi
 }
+
+# Set a level and read it back, up to three times: a monitor can miss a DDC/CI
+# command, and omarchy-brightness-display skips a run while another holds its
+# lock, both without an error.
+apply_level() {
+  local c=$1 level=$2 kind=${3:-${D_KIND[$1]:-percent}} dev=${4:-${D_DEV[$1]:-}} try got
+  for try in 1 2 3; do
+    set_level "$c" "$level" "$kind" "$dev"
+    if got=$(get_level "$c" "$kind" "$dev"); then
+      # A percentage read back over DDC/CI can round one step either way.
+      if [[ $kind == backlight ]] && (( got == level )); then return 0; fi
+      if [[ $kind != backlight ]] && (( got - level <= 1 && level - got <= 1 )); then return 0; fi
+    fi
+    (( try < 3 )) && sleep "0.$(( try * 3 ))"
+  done
+  return 1
+}
+
+# A saved level in this screen's units (the 1.0 prototype saved percentages).
+in_units() {
+  local c=$1 kind=$2 v=$3
+  if [[ $kind == "${D_KIND[$c]}" ]]; then
+    echo "$v"
+  elif [[ ${D_KIND[$c]} == backlight ]]; then
+    round "$(calc "$v * ${D_MAX[$c]} / 100")"
+  else
+    round "$(calc "$v * 100 / ${D_MAX[$c]}")"
+  fi
+}
+
+min() { if (( $1 < $2 )); then echo "$1"; else echo "$2"; fi; }
 
 is_connected() {
   local c
@@ -391,20 +424,32 @@ keyboard_on() {
   if [[ $(jq -r '.keyboard.device // ""' <<<"$S") != "$dev" ]]; then
     js --arg d "$dev" --argjson v "$cur" '.keyboard = {device: $d, level: $v}'
   fi
+  # Lowest lit step, or off; never brighter than it is (an unlit keyboard stays unlit).
   local target=0
-  if [[ $mode == dim ]]; then
-    target=1
-    (( cur == 0 )) && target=0   # leave an unlit keyboard unlit
-  fi
-  brightnessctl -q -d "$dev" set "$target" >/dev/null 2>&1
+  [[ $mode == dim ]] && target=$(min 1 "$cur")
+  (( target == cur )) || brightnessctl -q -d "$dev" set "$target" >/dev/null 2>&1
 }
 
+# Put the keyboard back and check it; on failure keep the saved level.
 keyboard_off() {
-  local dev level
+  local dev level try got
   dev=$(jq -r '.keyboard.device // ""' <<<"$S")
   level=$(jq -r '.keyboard.level // ""' <<<"$S")
-  if [[ -n $dev && $level =~ ^[0-9]+$ ]]; then
-    brightnessctl -q -d "$dev" set "$level" >/dev/null 2>&1
+  if [[ -n $dev && $level =~ ^[0-9]+$ && -r $SYSFS/class/leds/$dev/brightness ]]; then
+    for try in 1 2 3; do
+      brightnessctl -q -d "$dev" set "$level" >/dev/null 2>&1
+      got=$(<"$SYSFS/class/leds/$dev/brightness")
+      [[ $got == "$level" ]] && { js '.keyboard = null'; return 0; }
+      (( try < 3 )) && sleep "0.$(( try * 3 ))"
+    done
+    js '.keyboard.failedRestores = ((.keyboard.failedRestores // 0) + 1)'
+    warn "could not put the keyboard backlight back to $level"
+    if [[ $(jq -r '.keyboard.failedRestores' <<<"$S") == 1 ]]; then
+      FIRST_FAILURES=$(( FIRST_FAILURES + 1 ))
+    else
+      js '.keyboard = null'   # second miss in a row: give up on the keyboard
+    fi
+    return 1
   fi
   js '.keyboard = null'
 }
@@ -430,20 +475,43 @@ apply_night() {
     fi
   done
   compute_target
+  local prev original
   for c in "${CONNECTED[@]}"; do
     jq -e --arg c "$c" '.saved[$c]' <<<"$S" >/dev/null || continue
-    level=$(night_level "$c")
-    [[ $(jq -r --arg c "$c" '.saved[$c].setLevel // ""' <<<"$S") == "$level" ]] && continue
-    if set_level "$c" "$level"; then
+    # Night mode only ever dims: never above the level saved when it turned
+    # on, nor above where the screen is now (you may have dimmed it further).
+    original=$(saved_original "$c")
+    level=$(min "$(night_level "$c")" "$original")
+    prev=$(jq -r --arg c "$c" '.saved[$c].setLevel // ""' <<<"$S")
+    [[ $prev == "$level" ]] && continue
+    if [[ -n $prev ]] && cur=$(get_level "$c"); then
+      level=$(min "$level" "$cur")
+      [[ $level == "$cur" ]] && { js --arg c "$c" --argjson l "$level" '.saved[$c].setLevel = $l'; continue; }
+    fi
+    if [[ $level == "$original" && -z $prev ]]; then
+      js --arg c "$c" --argjson l "$level" '.saved[$c].setLevel = $l'   # already at or below night level
+    elif apply_level "$c" "$level"; then
       js --arg c "$c" --argjson l "$level" '.saved[$c].setLevel = $l'
+    else
+      warn "could not dim $c to $level"
     fi
   done
 }
 
-# Put back every connected screen's saved level; screens that are unplugged
-# keep their entry and are restored by `sync` when they come back.
+saved_original() {
+  local c=$1 kind level
+  kind=$(jq -r --arg c "$c" '.saved[$c].kind' <<<"$S")
+  level=$(jq -r --arg c "$c" '.saved[$c].level' <<<"$S")
+  in_units "$c" "$kind" "$level"
+}
+
+# Put back every connected screen's saved level and check it took. A screen
+# that does not take it keeps its saved level for the next try; unplugged
+# screens keep theirs until `sync` sees them again. Returns the failures.
+FIRST_FAILURES=0
 restore_saved() {
-  local c kind level dev key
+  local c kind level dev key n
+  FIRST_FAILURES=0
   while IFS=$'\t' read -r c kind level dev key; do
     [[ -n $c ]] || continue
     is_connected "$c" || continue
@@ -451,8 +519,14 @@ restore_saved() {
       js --arg c "$c" 'del(.saved[$c])'
       continue
     fi
-    set_level "$c" "$level" "$kind" "$dev"
-    js --arg c "$c" 'del(.saved[$c])'
+    if apply_level "$c" "$level" "$kind" "$dev"; then
+      js --arg c "$c" 'del(.saved[$c])'
+    else
+      js --arg c "$c" '.saved[$c].failedRestores = ((.saved[$c].failedRestores // 0) + 1)'
+      n=$(jq -r --arg c "$c" '.saved[$c].failedRestores' <<<"$S")
+      (( n == 1 )) && FIRST_FAILURES=$(( FIRST_FAILURES + 1 ))
+      warn "could not put $c back to $level; it is kept for the next try"
+    fi
   done < <(jq -r '.saved | to_entries[] | [.key, .value.kind, (.value.level | tostring), (.value.device // ""), (.value.key // "")] | @tsv' <<<"$S")
 }
 
@@ -469,6 +543,14 @@ cmd_off() {
   scan
   restore_saved
   keyboard_off
+  # Something missed its level for the first time: stay on, so the moon stays
+  # lit and the next click tries again. A second miss in a row lets night mode
+  # go off; that screen keeps its saved level for `sync` (a replug) or the next
+  # turn on and off, so its own brightness is never lost.
+  if (( FIRST_FAILURES > 0 )); then
+    save_state
+    return 1
+  fi
   js '.on = false | .target = null | .reference = null'
   save_state
 }
@@ -487,7 +569,7 @@ cmd_sync() {
 status() { [[ $(jq -r '.on' <<<"$S") == true ]] && echo on || echo off; }
 
 cmd_info() {
-  local json=${1:-} c level night now_nits rows=() on target ref ref_name
+  local json=${1:-} c level night matched base now_nits rows=() on target ref ref_name
   scan
   remember_screens
   on=$(status)
@@ -500,20 +582,26 @@ cmd_info() {
     if level=$(get_level "$c"); then
       mark_controllable "$c" true
       now_nits=$(nits_at "$c" "$level")
-      night=$(night_level "$c")
+      matched=$(night_level "$c")
+      # Night mode never brightens: it works from the level saved when it
+      # turned on, or from where the screen is now.
+      base=$level
+      jq -e --arg c "$c" '.saved[$c]' <<<"$S" >/dev/null && base=$(saved_original "$c")
+      night=$(min "$matched" "$base")
     else
       mark_controllable "$c" false
-      level=""; now_nits=""; night=""
+      level=""; now_nits=""; night=""; matched=""
     fi
     rows+=("$(jq -cn --arg c "$c" --arg name "${D_DESC[$c]}" --arg control "${D_KIND[$c]}" \
       --arg dev "${D_DEV[$c]}" --argjson max "${D_NITS[$c]}" --arg src "${D_SRC[$c]}" \
       --argjson levelMax "${D_MAX[$c]}" --arg level "$level" --arg now "$now_nits" \
-      --arg night "$night" --argjson trim "$(trim_of "$c")" \
+      --arg night "$night" --arg matched "$matched" --argjson trim "$(trim_of "$c")" \
       --argjson low "$(nits_at "$c" "$(lowest_level "$c")")" '
       {connector: $c, name: $name, control: $control, device: $dev, maxNits: $max,
        source: $src, levelMax: $levelMax, nitsAtLowest: $low, trim: $trim,
        level: ($level | tonumber? // null), nits: ($now | tonumber? // null),
-       nightLevel: ($night | tonumber? // null)}')")
+       nightLevel: ($night | tonumber? // null), matchedLevel: ($matched | tonumber? // null),
+       keepsOwnLevel: (($night | tonumber? // 0) < ($matched | tonumber? // 0))}')")
   done
   save_state
 
@@ -539,7 +627,9 @@ cmd_info() {
       "  at 1 %    \(.nitsAtLowest | n) cd/m²" + (if .control == "backlight" then "" else " (assumes \($floor) % of maximum at 0 %)" end),
       (if .level == null then "  now       brightness cannot be read or set (no DDC/CI)"
        else "  now       \(lvl(.level)) · \(.nits | n) cd/m²" end),
-      (if .nightLevel == null then empty else "  night     \(lvl(.nightLevel))" end),
+      (if .nightLevel == null then empty
+       elif .keepsOwnLevel then "  night     \(lvl(.nightLevel)) (already darker than the night level, \(lvl(.matchedLevel)), so it stays)"
+       else "  night     \(lvl(.nightLevel))" end),
       (if .trim != 1 then "  calibrated ×\(.trim * 100 | round / 100)" else empty end)
     ' <<<"$r"
   done
@@ -573,6 +663,10 @@ cmd_calibrate() {
   for c in "${CONNECTED[@]}"; do
     jq -e --arg c "$c" '.saved[$c]' <<<"$S" >/dev/null || continue
     [[ ${D_KEY[$c]} == "$ref" ]] && continue
+    if (( $(saved_original "$c") < $(night_level "$c") )); then
+      printf '%s was already darker than the night level, so night mode leaves it where you had it.\n' "$c"
+      continue
+    fi
     candidates+=("$c")
   done
 
@@ -588,9 +682,12 @@ cmd_calibrate() {
     printf '\nNight mode is on. Look at %s (%s) and %s side by side.\n' "${D_DESC[$c]}" "$c" "$ref_name"
     printf 'Up / Down to make %s brighter or dimmer, Enter to save, Esc to cancel.\n\n' "$c"
     old_trim=$(trim_of "$c"); trim=$old_trim
+    local own
+    own=$(saved_original "$c")
     while :; do
-      level=$(level_for "$c" "$(calc "$(target_nits) * $trim")")
+      level=$(min "$(level_for "$c" "$(calc "$(target_nits) * $trim")")" "$own")
       printf '\r\e[K  %s: %s cd/m² (level %s)' "$c" "$(fmt_nits "$(nits_at "$c" "$level")")" "$level"
+      [[ $level == "$own" ]] && printf ' (your own level: night mode goes no brighter)'
       choice=$(read_key) || choice=cancel
       case $choice in
       up) trim=$(calc "$trim * $CALIBRATE_STEP") ;;
@@ -604,12 +701,12 @@ cmd_calibrate() {
         break ;;
       cancel)
         trim=$old_trim
-        set_level "$c" "$(level_for "$c" "$(calc "$(target_nits) * $trim")")"
+        set_level "$c" "$(min "$(level_for "$c" "$(calc "$(target_nits) * $trim")")" "$own")"
         printf '\n  Cancelled.\n'
         break ;;
       *) continue ;;
       esac
-      set_level "$c" "$(level_for "$c" "$(calc "$(target_nits) * $trim")")"
+      set_level "$c" "$(min "$(level_for "$c" "$(calc "$(target_nits) * $trim")")" "$own")"
     done
   done
   [[ $was_on == off ]] && cmd_off
@@ -645,7 +742,7 @@ main() {
   load_state
   case $cmd in
   on) [[ $(status) == on ]] || cmd_on ;;
-  off) [[ $(status) == off ]] || cmd_off ;;
+  off) cmd_off ;;
   toggle) if [[ $(status) == on ]]; then cmd_off; else cmd_on; fi ;;
   status) ;;
   sync) cmd_sync ;;

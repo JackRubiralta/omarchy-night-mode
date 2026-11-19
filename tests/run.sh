@@ -70,6 +70,10 @@ if [[ $mon == eDP-* ]]; then              # Omarchy drives the laptop backlight 
 fi
 f="$MOCK/ddc-$mon"
 [[ -f $f ]] || exit 1                      # no DDC/CI on this monitor
+if [[ -n $step && -f $MOCK/drop-$mon ]]; then  # the monitor misses N writes, silently
+  n=$(<"$MOCK/drop-$mon")
+  if (( n > 0 )); then echo $(( n - 1 )) >"$MOCK/drop-$mon"; exit 0; fi
+fi
 if [[ -z $step ]]; then cat "$f"; else echo "${step%\%}" >"$f"; fi
 EOF
   chmod +x "$W/bin/"*
@@ -196,9 +200,68 @@ if [[ ! -e $NIGHT_MODE_STATE_DIR/saved ]]; then ok "old file removed"; else bad 
 eq "keyboard from old state restored" "$(kbd)" "2"
 teardown
 
+echo "only ever dims"
+setup
+echo 8 >"$NIGHT_MODE_SYSFS/class/backlight/intel_backlight/brightness"
+"$NM" on >/dev/null
+eq "laptop already darker than 17/400 stays at 8" "$(laptop)" "8"
+eq "monitor still dims to 1 %" "$(ddc DP-2)" "1"
+contains() { if [[ $2 == *"$3"* ]]; then ok "$1"; else bad "$1" "no '$3' in: $2"; fi; }
+contains "info says the laptop keeps its level" "$("$NM" info)" "night     8/400 (already darker than the night level, 17/400, so it stays)"
+"$NM" off >/dev/null
+eq "laptop back to its own 8" "$(laptop)" "8"
+eq "monitor back to 70 %" "$(ddc DP-2)" "70"
+echo 1 >"$MOCK/ddc-DP-2"
+echo 1 >"$NIGHT_MODE_SYSFS/class/leds/dell::kbd_backlight/brightness"
+"$NM" on >/dev/null
+eq "monitor already at 1 % stays" "$(ddc DP-2)" "1"
+eq "keyboard already on its lowest step stays" "$(kbd)" "1"
+"$NM" off >/dev/null
+echo 0 >"$NIGHT_MODE_SYSFS/class/leds/dell::kbd_backlight/brightness"
+"$NM" on >/dev/null
+eq "unlit keyboard stays unlit" "$(kbd)" "0"
+"$NM" off >/dev/null
+teardown
+
+echo "hand-dimmed during night mode"
+setup
+"$NM" on >/dev/null
+echo 5 >"$NIGHT_MODE_SYSFS/class/backlight/intel_backlight/brightness"   # brightness key
+echo '{"bar":{"layout":{"centerEnd":[{"id":"io.github.jackrubiralta.night-mode","brightness":30}]}}}' >"$NIGHT_MODE_SHELL_JSON"
+"$NM" sync >/dev/null
+eq "a higher night level does not raise a hand-dimmed screen" "$(laptop)" "5"
+echo '{"bar":{"layout":{"centerEnd":[{"id":"io.github.jackrubiralta.night-mode","brightness":4}]}}}' >"$NIGHT_MODE_SHELL_JSON"
+"$NM" sync >/dev/null
+eq "a lower night level still dims further" "$(laptop)" "4"
+"$NM" off >/dev/null
+eq "off still restores the level from before night mode" "$(laptop)" "240"
+teardown
+
+echo "restores are checked"
+setup
+"$NM" on >/dev/null
+echo 1 >"$MOCK/drop-DP-2"
+eq "a missed write is retried" "$("$NM" off 2>/dev/null)" "off"
+eq "monitor back to 70 % after the retry" "$(ddc DP-2)" "70"
+"$NM" on >/dev/null
+echo 99 >"$MOCK/drop-DP-2"
+eq "a monitor that will not take its level keeps night mode on" "$("$NM" off 2>/dev/null)" "on"
+eq "laptop still restored meanwhile" "$(laptop)" "240"
+eq "monitor's own level kept" "$(jq -r '.saved["DP-2"].level' "$NIGHT_MODE_STATE_DIR/state.json")" "70"
+eq "second miss in a row lets night mode go off" "$("$NM" toggle 2>/dev/null)" "off"
+eq "monitor's own level still kept" "$(jq -r '.saved["DP-2"].level' "$NIGHT_MODE_STATE_DIR/state.json")" "70"
+echo 0 >"$MOCK/drop-DP-2"
+"$NM" sync >/dev/null
+eq "next sync puts it back" "$(ddc DP-2)" "70"
+eq "and clears it" "$(jq -c '.saved' "$NIGHT_MODE_STATE_DIR/state.json")" "{}"
+"$NM" on >/dev/null
+echo 2 >"$MOCK/drop-DP-2"
+"$NM" off >/dev/null 2>&1
+eq "two missed writes within one restore are still retried" "$(ddc DP-2)" "70"
+teardown
+
 echo "info"
 setup
-contains() { if [[ $2 == *"$3"* ]]; then ok "$1"; else bad "$1" "no '$3' in: $2"; fi; }
 info_text=$("$NM" info)
 contains "info shows laptop maximum" "$info_text" "maximum   400 cd/m² (EDID brightness range)"
 contains "info shows monitor night level" "$info_text" "night     1 %"
