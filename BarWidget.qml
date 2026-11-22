@@ -96,9 +96,17 @@ BarWidget {
   // Monitors come and go with docks and cables: dim a new one when night mode
   // is on, and give an unplugged one its own brightness back when it returns.
   // DDC/CI needs a moment after a hotplug before it answers.
+  // A second pass catches a monitor that was still waking up (or reset its own
+  // brightness after answering) at the first one; sync reads every screen, so
+  // running it twice is harmless.
   Timer {
     id: syncTimer
     interval: 2500
+    onTriggered: { root.run("sync"); lateSyncTimer.restart() }
+  }
+  Timer {
+    id: lateSyncTimer
+    interval: 8000
     onTriggered: root.run("sync")
   }
 

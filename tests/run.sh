@@ -152,6 +152,22 @@ eq "replugged monitor gets its brightness back" "$(ddc DP-2)" "70"
 eq "pending entry cleared" "$(jq -c '.saved' "$NIGHT_MODE_STATE_DIR/state.json")" "{}"
 teardown
 
+echo "monitor comes back bright while on"
+setup
+"$NM" on >/dev/null
+monitors eDP-1
+echo 100 >"$MOCK/ddc-DP-2"                 # unplugged, powers up at its own brightness
+monitors eDP-1 DP-2
+"$NM" sync >/dev/null
+eq "replugged monitor is dimmed again" "$(ddc DP-2)" "1"
+eq "its own level is still the first one" "$(jq -r '.saved["DP-2"].level' "$NIGHT_MODE_STATE_DIR/state.json")" "70"
+echo 1 >"$MOCK/ddc-DP-2"; echo 9 >"$NIGHT_MODE_SYSFS/class/backlight/intel_backlight/brightness"
+"$NM" sync >/dev/null
+eq "a screen you dimmed further is left alone" "$(laptop)" "9"
+"$NM" off >/dev/null
+eq "off restores the monitor's own level" "$(ddc DP-2)" "70"
+teardown
+
 echo "first run with a laptop only"
 setup
 monitors eDP-1

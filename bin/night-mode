@@ -13,7 +13,7 @@
 set -uo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.1.1"
 readonly PLUGIN_ID="io.github.jackrubiralta.night-mode"
 
 SYSFS="${NIGHT_MODE_SYSFS:-/sys}"
@@ -483,10 +483,17 @@ apply_night() {
     original=$(saved_original "$c")
     level=$(min "$(night_level "$c")" "$original")
     prev=$(jq -r --arg c "$c" '.saved[$c].setLevel // ""' <<<"$S")
-    [[ $prev == "$level" ]] && continue
+    # Read the screen rather than trust setLevel: a monitor that was unplugged,
+    # switched off or woken from standby often comes back at its own brightness.
     if [[ -n $prev ]] && cur=$(get_level "$c"); then
-      level=$(min "$level" "$cur")
-      [[ $level == "$cur" ]] && { js --arg c "$c" --argjson l "$level" '.saved[$c].setLevel = $l'; continue; }
+      # Darker than night mode left it (you dimmed it further): leave it.
+      # Brighter (a replug or power cycle reset it): dim it again.
+      if (( cur <= prev )); then
+        level=$(min "$level" "$cur")
+        [[ $level == "$cur" ]] && { js --arg c "$c" --argjson l "$level" '.saved[$c].setLevel = $l'; continue; }
+      fi
+    elif [[ $prev == "$level" ]]; then
+      continue
     fi
     if [[ $level == "$original" && -z $prev ]]; then
       js --arg c "$c" --argjson l "$level" '.saved[$c].setLevel = $l'   # already at or below night level

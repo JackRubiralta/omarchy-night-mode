@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1 – 2026-11-22
+
+- **A monitor plugged in during night mode is dimmed again.** A monitor unplugged while night mode was on often comes back at its own full brightness, but `sync` trusted the level it had set before and left it bright. It now reads every screen and dims any that came back brighter; one you dimmed further by hand is still left alone.
+- The bar runs a second `sync` 8 s after a plug or unplug, for monitors that are slow to answer DDC/CI.
+
 ## 1.1.0 – 2026-11-19
 
 - **Night mode only ever dims.** Each screen goes to the lower of the matched night level and its own level, so a screen already darker than the night level stays where it is. A screen dimmed further by hand while night mode is on is not raised again when the night level changes (a monitor plugged in, a new setting). The keyboard is never brightened either.
