@@ -13,7 +13,7 @@
 set -uo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.1.1"
+readonly VERSION="1.2.0"
 readonly PLUGIN_ID="io.github.jackrubiralta.night-mode"
 
 SYSFS="${NIGHT_MODE_SYSFS:-/sys}"
@@ -39,8 +39,9 @@ Usage: night-mode [command]
   toggle           Turn night mode on or off (default)
   on | off         Turn night mode on or off
   status           Print "on" or "off"
-  sync             Dim screens plugged in while night mode is on, restore
-                   screens unplugged while it was on
+  sync             Bring every connected screen to what night mode is now:
+                   dim it when on, give it its own level back when off
+                   (exits 75 when a screen did not answer yet)
   info [--json]    Show every screen, its luminance and its night level
   calibrate        Match a screen to the others by eye (needs a terminal)
   forget [screen]  Forget one screen's data and calibration, or all of them
@@ -175,8 +176,12 @@ load_state() {
   S='{}'
   [[ -s $STATE ]] && S=$(jq -c '.' "$STATE" 2>/dev/null) || S='{}'
   [[ -n $S ]] || S='{}'
+  # Saved levels belong to a screen, not a port. Up to 1.1 they were filed under
+  # the connector; such an entry gets its connector recorded here, and `scan`
+  # moves it to its screen's id when that screen next shows up, on any port.
   S=$(jq -c '{on: (.on // false), target: .target, reference: .reference,
-    saved: (.saved // {}), keyboard: .keyboard, displays: (.displays // {})}' <<<"$S")
+    saved: (.saved // {} | with_entries(.value.connector //= .key)),
+    keyboard: .keyboard, displays: (.displays // {})}' <<<"$S")
   migrate_v0
 }
 
@@ -197,7 +202,7 @@ migrate_v0() {
   while read -r kind name val; do
     [[ $val =~ ^[0-9]+$ ]] || continue
     case $kind in
-    display) js --arg c "$name" --argjson v "$val" '.saved[$c] = {kind: "percent", level: $v, setLevel: null, key: null}' ;;
+    display) js --arg c "$name" --argjson v "$val" '.saved[$c] = {kind: "percent", level: $v, setLevel: null, key: null, connector: $c}' ;;
     kbd) js --arg d "$name" --argjson v "$val" '.keyboard = {device: $d, level: $v}' ;;
     esac
   done <"$old"
@@ -207,7 +212,7 @@ migrate_v0() {
 
 # --- screens -----------------------------------------------------------------
 
-declare -A D_KEY D_DESC D_KIND D_DEV D_MAX D_NITS D_SRC
+declare -A D_KEY D_ID D_DESC D_KIND D_DEV D_MAX D_NITS D_SRC
 CONNECTED=()
 
 backlight_device() {
@@ -224,15 +229,20 @@ backlight_device() {
 
 is_internal() { [[ $1 =~ ^(eDP|LVDS|DSI)- ]]; }
 
-# Fill the D_* tables for every enabled monitor. Nothing here talks DDC/CI.
+# Fill the D_* tables for every enabled monitor, plus a laptop panel switched
+# off with its lid closed (its backlight still answers, and it should already
+# be right when the lid opens). Nothing here talks DDC/CI.
 scan() {
-  local monitors name desc edid lum key bl
+  local monitors name desc disabled edid lum key bl
   have hyprctl || die "hyprctl not found (night mode needs Hyprland)"
-  monitors=$(hyprctl monitors -j 2>/dev/null) || die "cannot reach Hyprland"
+  monitors=$(hyprctl monitors all -j 2>/dev/null) || die "cannot reach Hyprland"
   CONNECTED=()
   bl=$(backlight_device) || bl=""
-  while IFS=$'\t' read -r name desc; do
+  while IFS=$'\t' read -r name desc disabled; do
     [[ -n $name ]] || continue
+    if [[ $disabled == true ]] && ! { is_internal "$name" && [[ -n $bl ]]; }; then
+      continue
+    fi
     CONNECTED+=("$name")
     D_DESC[$name]=$desc
     edid=$(edid_file "$name") || edid=""
@@ -257,8 +267,49 @@ scan() {
     else
       D_NITS[$name]=$FALLBACK_EXTERNAL_NITS; D_SRC[$name]="no EDID data, typical monitor value"
     fi
-  done < <(jq -r '.[] | select(.disabled != true) | [.name, ([.make, .model] | map(select(. != null and . != "")) | join(" ") | if . == "" then (.description // "") else . end)] | @tsv' <<<"$monitors")
+  done < <(jq -r '.[] | [.name, ([.make, .model] | map(select(. != null and . != "")) | join(" ") | if . == "" then (.description // "") else . end), (.disabled == true)] | @tsv' <<<"$monitors")
+
+  # A screen's id is its EDID identity, so its saved level follows it from
+  # port to port. Two identical monitors plugged in at once (same EDID) are
+  # told apart by their ports.
+  local c n
+  declare -A count=()
+  for c in "${CONNECTED[@]}"; do count[${D_KEY[$c]}]=$(( ${count[${D_KEY[$c]}]:-0} + 1 )); done
+  for c in "${CONNECTED[@]}"; do
+    n=${count[${D_KEY[$c]}]}
+    if (( n > 1 )); then D_ID[$c]="${D_KEY[$c]}@$c"; else D_ID[$c]=${D_KEY[$c]}; fi
+  done
+  claim_saved
 }
+
+# Give each connected screen the saved level it left behind, wherever it was
+# filed: under its id; under the port it used before (1.1 state); or, when it
+# comes back on another port or two identical monitors swap, any entry with
+# its EDID identity that no other connected screen owns. Saved levels of
+# screens that are away stay untouched until they come back.
+claim_saved() {
+  local c screens=()
+  for c in "${CONNECTED[@]}"; do
+    screens+=("$(jq -cn --arg id "${D_ID[$c]}" --arg key "${D_KEY[$c]}" --arg c "$c" '{id: $id, key: $key, connector: $c}')")
+  done
+  (( ${#screens[@]} )) || return 0
+  js --argjson screens "$(printf '%s\n' "${screens[@]}" | jq -cs '.')" '
+    ($screens | map(.id)) as $owned
+    | reduce $screens[] as $s (.;
+        if .saved[$s.id] then .saved[$s.id].connector = $s.connector
+        else
+          ([.saved | to_entries[]
+            | select(.key as $id | $owned | index($id) | not)
+            | select(.value.key == $s.key or (.value.key == null and .value.connector == $s.connector))]
+           | sort_by(if .value.connector == $s.connector then 0 else 1 end) | first) as $e
+          | if $e then .saved |= (del(.[$e.key]) + {($s.id): ($e.value + {key: $s.key, connector: $s.connector})})
+            else . end
+        end)'
+}
+
+# The saved entry of a connected screen.
+has_saved() { jq -e --arg id "${D_ID[$1]}" '.saved[$id]' <<<"$S" >/dev/null; }
+saved_field() { jq -r --arg id "${D_ID[$1]}" --arg f "$2" '.saved[$id][$f] // "" | tostring' <<<"$S"; }
 
 lowest_level() {
   local c=$1
@@ -301,6 +352,19 @@ wait_brightness_lock() {
 
 warn() { echo "night-mode: $*" >&2; }
 
+# A monitor that has just been plugged in, or woken with the laptop, can take
+# several seconds to answer DDC/CI. When it misses one read, Omarchy's DDC
+# helper marks it unavailable and refuses every call for the next 60 s, which
+# would swallow every retry. For a monitor that has answered before, clear
+# that mark so each try really asks the monitor.
+ddc_unblock() {
+  local c=$1 f word
+  [[ $(jq -r --arg k "${D_KEY[$c]:-}" '.displays[$k].controllable // ""' <<<"$S") == true ]] || return 0
+  f="${XDG_RUNTIME_DIR:-/tmp}/omarchy-brightness-display-ddc/${c//[^[:alnum:]_.-]/_}.bus"
+  [[ -r $f ]] && read -r word _ <"$f" && [[ $word == unavailable ]] && rm -f "$f"
+  return 0
+}
+
 get_level() {
   local c=$1 kind=${2:-${D_KIND[$1]}} dev=${3:-${D_DEV[$1]:-}} v
   if [[ $kind == backlight ]]; then
@@ -308,6 +372,7 @@ get_level() {
   else
     have omarchy-brightness-display || return 1
     wait_brightness_lock
+    ddc_unblock "$c"
     v=$(omarchy-brightness-display --monitor "$c" 2>/dev/null) || return 1
   fi
   [[ $v =~ ^[0-9]+$ ]] || return 1
@@ -320,6 +385,7 @@ set_level() {
     brightnessctl -q -c backlight -d "$dev" set "$level" >/dev/null 2>&1
   else
     wait_brightness_lock
+    ddc_unblock "$c"
     omarchy-brightness-display --no-osd --monitor "$c" "${level}%" >/dev/null 2>&1
   fi
 }
@@ -355,12 +421,6 @@ in_units() {
 
 min() { if (( $1 < $2 )); then echo "$1"; else echo "$2"; fi; }
 
-is_connected() {
-  local c
-  for c in "${CONNECTED[@]}"; do [[ $c == "$1" ]] && return 0; done
-  return 1
-}
-
 # Record what the connected screens are, keeping each one's calibration.
 remember_screens() {
   local c lowest
@@ -375,8 +435,13 @@ remember_screens() {
   done
 }
 
+# A screen that has answered once stays controllable: one missed read (a
+# monitor still waking up) must not drop it from the target, or every other
+# screen would be dimmed further until the next replug.
 mark_controllable() {
-  js --arg k "${D_KEY[$1]}" --argjson ok "$2" 'if .displays[$k] then .displays[$k].controllable = $ok else . end'
+  js --arg k "${D_KEY[$1]}" --argjson ok "$2" '
+    if .displays[$k] and ($ok or .displays[$k].controllable != true)
+    then .displays[$k].controllable = $ok else . end'
 }
 
 trim_of() { jq -r --arg k "${D_KEY[$1]}" '.displays[$k].trim // 1' <<<"$S"; }
@@ -456,85 +521,108 @@ keyboard_off() {
 
 # --- commands ----------------------------------------------------------------
 
+# Night mode treats a screen that is away as if it were still plugged in. Each
+# screen it dims keeps a saved entry (its own level, and the level night mode
+# set) until night mode puts that level back, however many times it is
+# unplugged, replugged on another port, or night mode is turned on and off
+# meanwhile. Whenever a screen shows up, it is brought to whatever night mode
+# is now: dimmed when it is on, its own level when it is off.
+#
+# PENDING counts connected screens still left to do because they did not
+# answer (a monitor waking up): `sync` exits 75 so the bar tries again.
+PENDING=0
+
 # Dim every connected screen to the target; save each level first.
 apply_night() {
-  local c level saved_key cur
+  local c id level cur
+  local -A now=()
   for c in "${CONNECTED[@]}"; do
-    saved_key=$(jq -r --arg c "$c" '.saved[$c].key // ""' <<<"$S")
-    if [[ -n $saved_key && $saved_key != "${D_KEY[$c]}" ]]; then
-      js --arg c "$c" 'del(.saved[$c])'   # a different screen now sits on this port
+    id=${D_ID[$c]}
+    has_saved "$c" && continue
+    if ! cur=$(get_level "$c"); then
+      mark_controllable "$c" false
+      PENDING=$(( PENDING + 1 ))
+      continue
     fi
-    if ! jq -e --arg c "$c" '.saved[$c]' <<<"$S" >/dev/null; then
-      if ! cur=$(get_level "$c"); then
-        mark_controllable "$c" false
-        continue
-      fi
-      mark_controllable "$c" true
-      js --arg c "$c" --arg k "${D_KEY[$c]}" --arg kind "${D_KIND[$c]}" --arg dev "${D_DEV[$c]}" \
-        --argjson v "$cur" '.saved[$c] = {key: $k, kind: $kind, device: $dev, level: $v, setLevel: null}'
-    fi
+    now[$c]=$cur
+    mark_controllable "$c" true
+    js --arg id "$id" --arg c "$c" --arg k "${D_KEY[$c]}" --arg kind "${D_KIND[$c]}" --arg dev "${D_DEV[$c]}" \
+      --argjson v "$cur" '.saved[$id] = {key: $k, connector: $c, kind: $kind, device: $dev, level: $v, setLevel: null}'
   done
   compute_target
   local prev original
   for c in "${CONNECTED[@]}"; do
-    jq -e --arg c "$c" '.saved[$c]' <<<"$S" >/dev/null || continue
+    id=${D_ID[$c]}
+    has_saved "$c" || continue
     # Night mode only ever dims: never above the level saved when it turned
     # on, nor above where the screen is now (you may have dimmed it further).
     original=$(saved_original "$c")
     level=$(min "$(night_level "$c")" "$original")
-    prev=$(jq -r --arg c "$c" '.saved[$c].setLevel // ""' <<<"$S")
+    prev=$(saved_field "$c" setLevel)
     # Read the screen rather than trust setLevel: a monitor that was unplugged,
     # switched off or woken from standby often comes back at its own brightness.
-    if [[ -n $prev ]] && cur=$(get_level "$c"); then
-      # Darker than night mode left it (you dimmed it further): leave it.
-      # Brighter (a replug or power cycle reset it): dim it again.
-      if (( cur <= prev )); then
-        level=$(min "$level" "$cur")
-        [[ $level == "$cur" ]] && { js --arg c "$c" --argjson l "$level" '.saved[$c].setLevel = $l'; continue; }
-      fi
-    elif [[ $prev == "$level" ]]; then
+    cur=${now[$c]:-}
+    if [[ -z $cur ]] && ! cur=$(get_level "$c"); then
+      PENDING=$(( PENDING + 1 ))   # not answering yet: the next sync tries again
       continue
     fi
-    if [[ $level == "$original" && -z $prev ]]; then
-      js --arg c "$c" --argjson l "$level" '.saved[$c].setLevel = $l'   # already at or below night level
-    elif apply_level "$c" "$level"; then
-      js --arg c "$c" --argjson l "$level" '.saved[$c].setLevel = $l'
+    if [[ -n $prev ]]; then
+      # Darker than night mode left it (you dimmed it further): leave it.
+      # Brighter: a monitor that was replugged or power-cycled resets its own
+      # brightness, so dim it again. A laptop backlight never resets itself,
+      # so a brighter one is you turning it up: leave that too.
+      if (( cur > prev )) && [[ ${D_KIND[$c]} == backlight ]]; then
+        continue
+      fi
+      if (( cur <= prev )); then
+        level=$(min "$level" "$cur")
+        if [[ $level == "$cur" ]]; then
+          js --arg id "$id" --argjson l "$level" '.saved[$id].setLevel = $l | del(.saved[$id].failedRestores)'
+          continue
+        fi
+      fi
+    elif (( cur <= level )); then
+      # Already at or below the night level.
+      js --arg id "$id" --argjson l "$cur" '.saved[$id].setLevel = $l'
+      continue
+    fi
+    if apply_level "$c" "$level"; then
+      js --arg id "$id" --argjson l "$level" '.saved[$id].setLevel = $l | del(.saved[$id].failedRestores)'
     else
+      PENDING=$(( PENDING + 1 ))
       warn "could not dim $c to $level"
     fi
   done
 }
 
 saved_original() {
-  local c=$1 kind level
-  kind=$(jq -r --arg c "$c" '.saved[$c].kind' <<<"$S")
-  level=$(jq -r --arg c "$c" '.saved[$c].level' <<<"$S")
-  in_units "$c" "$kind" "$level"
+  in_units "$1" "$(saved_field "$1" kind)" "$(saved_field "$1" level)"
 }
 
 # Put back every connected screen's saved level and check it took. A screen
-# that does not take it keeps its saved level for the next try; unplugged
-# screens keep theirs until `sync` sees them again. Returns the failures.
+# that does not take it keeps its saved level for the next try; screens that
+# are away keep theirs until they come back. Counts the first failures.
 FIRST_FAILURES=0
 restore_saved() {
-  local c kind level dev key n
+  local c id kind level dev n
   FIRST_FAILURES=0
-  while IFS=$'\t' read -r c kind level dev key; do
-    [[ -n $c ]] || continue
-    is_connected "$c" || continue
-    if [[ -n $key && -n ${D_KEY[$c]:-} && $key != "${D_KEY[$c]}" ]]; then
-      js --arg c "$c" 'del(.saved[$c])'
-      continue
-    fi
+  for c in "${CONNECTED[@]}"; do
+    id=${D_ID[$c]}
+    has_saved "$c" || continue
+    kind=$(saved_field "$c" kind)
+    level=$(saved_field "$c" level)
+    dev=$(saved_field "$c" device)
+    [[ $kind == backlight && -z $dev ]] && dev=${D_DEV[$c]:-}
     if apply_level "$c" "$level" "$kind" "$dev"; then
-      js --arg c "$c" 'del(.saved[$c])'
+      js --arg id "$id" 'del(.saved[$id])'
     else
-      js --arg c "$c" '.saved[$c].failedRestores = ((.saved[$c].failedRestores // 0) + 1)'
-      n=$(jq -r --arg c "$c" '.saved[$c].failedRestores' <<<"$S")
+      js --arg id "$id" '.saved[$id].failedRestores = ((.saved[$id].failedRestores // 0) + 1)'
+      n=$(saved_field "$c" failedRestores)
       (( n == 1 )) && FIRST_FAILURES=$(( FIRST_FAILURES + 1 ))
+      PENDING=$(( PENDING + 1 ))
       warn "could not put $c back to $level; it is kept for the next try"
     fi
-  done < <(jq -r '.saved | to_entries[] | [.key, .value.kind, (.value.level | tostring), (.value.device // ""), (.value.key // "")] | @tsv' <<<"$S")
+  done
 }
 
 cmd_on() {
@@ -562,15 +650,20 @@ cmd_off() {
   save_state
 }
 
+# Bring every connected screen to what night mode is now. Exits 75 when a
+# screen did not answer yet, so the bar runs it again a little later.
+readonly EX_TRY_AGAIN=75
 cmd_sync() {
   scan
   remember_screens
+  PENDING=0
   if [[ $(jq -r '.on' <<<"$S") == true ]]; then
     apply_night
   else
     restore_saved
   fi
   save_state
+  (( PENDING == 0 )) || return "$EX_TRY_AGAIN"
 }
 
 status() { [[ $(jq -r '.on' <<<"$S") == true ]] && echo on || echo off; }
@@ -593,7 +686,7 @@ cmd_info() {
       # Night mode never brightens: it works from the level saved when it
       # turned on, or from where the screen is now.
       base=$level
-      jq -e --arg c "$c" '.saved[$c]' <<<"$S" >/dev/null && base=$(saved_original "$c")
+      has_saved "$c" && base=$(saved_original "$c")
       night=$(min "$matched" "$base")
     else
       mark_controllable "$c" false
@@ -668,7 +761,7 @@ cmd_calibrate() {
   scan
   ref=$(reference_key)
   for c in "${CONNECTED[@]}"; do
-    jq -e --arg c "$c" '.saved[$c]' <<<"$S" >/dev/null || continue
+    has_saved "$c" || continue
     [[ ${D_KEY[$c]} == "$ref" ]] && continue
     if (( $(saved_original "$c") < $(night_level "$c") )); then
       printf '%s was already darker than the night level, so night mode leaves it where you had it.\n' "$c"
@@ -702,7 +795,7 @@ cmd_calibrate() {
       save)
         key=${D_KEY[$c]}
         js --arg k "$key" --argjson t "$trim" '.displays[$k].trim = $t'
-        js --arg c "$c" --argjson l "$level" '.saved[$c].setLevel = $l'
+        js --arg id "${D_ID[$c]}" --argjson l "$level" '.saved[$id].setLevel = $l'
         save_state
         printf '\n  Saved.\n'
         break ;;
@@ -743,8 +836,11 @@ main() {
 
   have jq || die "jq not found"
   mkdir -p "$STATE_DIR"
+  local asked started rc=0 last_start last_rc
+  asked=$(date +%s%N)
   exec {lock}>"$STATE_DIR/lock"
   flock -w 20 "$lock" || die "another night-mode run is stuck"
+  started=$(date +%s%N)
 
   load_state
   case $cmd in
@@ -752,13 +848,25 @@ main() {
   off) cmd_off ;;
   toggle) if [[ $(status) == on ]]; then cmd_off; else cmd_on; fi ;;
   status) ;;
-  sync) cmd_sync ;;
+  sync)
+    # The bar lives once per screen, so a plug or unplug asks for a sync from
+    # each copy. One that started after this one was asked for has already
+    # looked at every screen: take its result instead of asking them again.
+    if read -r last_start last_rc 2>/dev/null <"$STATE_DIR/last-sync" &&
+      [[ $last_start =~ ^[0-9]+$ && $last_rc =~ ^[0-9]+$ ]] && (( last_start > asked )); then
+      rc=$last_rc
+    else
+      cmd_sync; rc=$?
+      printf '%s %s\n' "$started" "$rc" >"$STATE_DIR/last-sync"
+    fi
+    ;;
   info) cmd_info "${2:-}"; return 0 ;;
   calibrate) cmd_calibrate; return 0 ;;
   forget) cmd_forget "${2:-all}"; return 0 ;;
   *) usage >&2; return 2 ;;
   esac
   status
+  return "$rc"
 }
 
 main "$@"

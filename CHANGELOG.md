@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0 – 2026-11-24
+
+- **A monitor that is away still counts as plugged in.** Saved levels now belong to the monitor (its EDID), not the port. Dim, unplug, turn night mode off on the laptop, plug back in: the monitor gets its own brightness back, on the same port or another one, however many times night mode was turned on and off meanwhile. A different monitor plugged into its port no longer wipes its saved level. State from 1.1 moves over by itself.
+- **Monitors that are slow to wake are not missed.** A monitor plugged in, or woken with the laptop, often doesn't answer DDC/CI for several seconds, and after one missed read Omarchy's DDC helper refuses that monitor for 60 s, so both of the bar's syncs failed and the monitor stayed dimmed. Night Mode now clears that pause for a monitor that has answered before, `sync` exits 75 while a screen is still unanswered, and the bar asks again for about three minutes.
+- The bar also syncs when the laptop wakes from sleep and when the shell starts, runs one sync when every screen's bar asks at once, and never drops a click that comes in during a sync.
+- A laptop panel switched off with the lid closed is dimmed and restored with the other screens.
+- One missed read no longer drops a monitor from the target (which dimmed the laptop further until the next replug).
+- A laptop backlight turned up by hand during night mode is left there by a sync (only monitors reset themselves).
+
 ## 1.1.1 – 2026-11-22
 
 - **A monitor plugged in during night mode is dimmed again.** A monitor unplugged while night mode was on often comes back at its own full brightness, but `sync` trusted the level it had set before and left it bright. It now reads every screen and dims any that came back brighter; one you dimmed further by hand is still left alone.

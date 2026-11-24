@@ -49,15 +49,26 @@ BarWidget {
   }
 
   // The state file is replaced with a rename, which can drop the watch, so
-  // read it again now and then as a backstop.
+  // read it again now and then as a backstop. The same tick notices the
+  // laptop waking from sleep (the clock jumped): monitors may have been
+  // plugged, unplugged or power-cycled meanwhile, so bring them up to date.
+  property real lastTick: Date.now()
   Timer {
     interval: 15000; running: true; repeat: true
-    onTriggered: stateFile.reload()
+    onTriggered: {
+      var now = Date.now()
+      if (now - root.lastTick > 45000) root.screensChanged()
+      root.lastTick = now
+      stateFile.reload()
+    }
   }
 
+  // Commands run one at a time, in order; a click is never dropped, and a
+  // sync already waiting is not queued twice.
+  property var queue: []
   Process {
     id: proc
-    property string pending: ""
+    property string current: ""
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -66,21 +77,24 @@ BarWidget {
         stateFile.reload()
       }
     }
-    onRunningChanged: {
-      if (!running && pending !== "") {
-        var next = pending
-        pending = ""
-        root.run(next)
-      }
+    onExited: function(exitCode, exitStatus) {
+      if (proc.current === "sync") root.syncFinished(exitCode)
     }
+    onRunningChanged: if (!running) Qt.callLater(root.runNext)
   }
 
   function run(command) {
-    if (proc.running) {
-      proc.pending = command
-      return
-    }
-    proc.command = [root.script, command]
+    if (command === "sync" && root.queue.indexOf("sync") !== -1) return
+    root.queue = root.queue.concat([command])
+    root.runNext()
+  }
+
+  function runNext() {
+    if (proc.running || root.queue.length === 0) return
+    var next = root.queue[0]
+    root.queue = root.queue.slice(1)
+    proc.current = next
+    proc.command = [root.script, next]
     proc.running = true
   }
 
@@ -93,20 +107,50 @@ BarWidget {
       root.shellQuote(root.script) + " calibrate"])
   }
 
-  // Monitors come and go with docks and cables: dim a new one when night mode
-  // is on, and give an unplugged one its own brightness back when it returns.
-  // DDC/CI needs a moment after a hotplug before it answers.
-  // A second pass catches a monitor that was still waking up (or reset its own
-  // brightness after answering) at the first one; sync reads every screen, so
-  // running it twice is harmless.
+  // Monitors come and go with docks, cables and sleep. Night mode treats a
+  // monitor that is away as still plugged in, so when one shows up it is
+  // brought to whatever night mode is now: dimmed when it is on, its own
+  // brightness when it is off.
+  //
+  // DDC/CI needs a moment after a hotplug, and a monitor waking from standby
+  // can take much longer. `sync` exits 75 while a screen has not answered, and
+  // the widget asks again with growing gaps, for about three minutes. After
+  // the first sync that works, one more 8 s later catches a monitor that resets
+  // its own brightness just after answering. sync reads every screen, so
+  // running it again is harmless.
+  readonly property int tryAgain: 75
+  readonly property var retryGaps: [3000, 6000, 12000, 25000, 45000, 70000]
+  property int retryStep: 0
+  property bool lateCheckDue: false
+
+  function screensChanged() {
+    root.retryStep = 0
+    root.lateCheckDue = true
+    retryTimer.stop()
+    syncTimer.restart()
+  }
+
+  function syncFinished(exitCode) {
+    if (exitCode === root.tryAgain) {
+      if (root.retryStep < root.retryGaps.length) {
+        retryTimer.interval = root.retryGaps[root.retryStep]
+        root.retryStep++
+        retryTimer.restart()
+      }
+    } else if (root.lateCheckDue) {
+      root.lateCheckDue = false
+      retryTimer.interval = 8000
+      retryTimer.restart()
+    }
+  }
+
   Timer {
     id: syncTimer
     interval: 2500
-    onTriggered: { root.run("sync"); lateSyncTimer.restart() }
+    onTriggered: root.run("sync")
   }
   Timer {
-    id: lateSyncTimer
-    interval: 8000
+    id: retryTimer
     onTriggered: root.run("sync")
   }
 
@@ -115,9 +159,13 @@ BarWidget {
     function onRawEvent(event) {
       var name = event ? String(event.name) : ""
       if (name === "monitoradded" || name === "monitoraddedv2" || name === "monitorremoved" || name === "monitorremovedv2")
-        syncTimer.restart()
+        root.screensChanged()
     }
   }
+
+  // The shell starting (login, restart) is a chance to catch anything that
+  // changed while it was not running.
+  Component.onCompleted: root.screensChanged()
 
   BarIconButton {
     id: button

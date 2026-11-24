@@ -45,7 +45,17 @@ The moon is full strength while night mode is on and dimmed while it is off.
 
 **Night mode only ever dims.** A screen that is already darker than the night level stays where it is, and turning night mode off leaves it there too. The same goes for a screen you dim further by hand while night mode is on, and for a keyboard that is already dim or unlit.
 
-Plug a monitor in while night mode is on and it dims to match within a few seconds. Unplug one while night mode is on, turn night mode off, and that monitor gets its own brightness back the next time you plug it in.
+**A monitor that is away still counts as plugged in.** Night Mode remembers each monitor by its EDID, not by the port, so when one comes back (on any port, after any number of clicks) it is set to whatever night mode is now:
+
+| While it was away | When it comes back |
+|---|---|
+| Night mode stayed on | Stays dimmed, or is dimmed again if it came back at its own brightness |
+| You turned night mode off | Gets its own brightness back, the level it had before night mode |
+| You turned night mode on | Dims to match; its own level is saved first |
+| Off, then on again | Stays dimmed; turning off later gives the level from before it left |
+| Another monitor used its port | That monitor is left alone; this one still gets its own level |
+
+A monitor that has just been plugged in, or woken with the laptop, can take a while to answer. The bar keeps asking for about three minutes, and gets past the 60 s pause Omarchy's DDC helper puts on a monitor that missed one read. It also catches up after the laptop wakes from sleep and when the shell starts. A laptop panel switched off with its lid closed is dimmed and restored with the rest, so it is right when the lid opens.
 
 The same script runs from a terminal or a keybinding. Link it onto your `PATH` once:
 
@@ -133,12 +143,13 @@ A screen that reports none of them is taken as a typical 300 cd/m² laptop panel
 | `i18n/*.json` | Tooltip translations; follows Setup > Language |
 | `~/.local/state/night-mode/state.json` | On or off, the saved levels, and every screen seen |
 
-Nothing runs in the background. The widget follows `state.json` and calls the script on a click or a monitor change.
+Nothing runs in the background. The widget follows `state.json` and calls the script on a click, a monitor change, waking from sleep or the shell starting. `night-mode sync` exits 75 while a screen has not answered yet, and the widget asks again.
 
 ## Limits
 
 - **HDR mode.** In HDR the compositor, not the backlight, sets how bright white is, so the matching assumes SDR.
 - **Monitors without DDC/CI**, and some TVs, can't be dimmed from the computer. `night-mode info` marks them, and they don't count towards the target.
+- **Two identical monitors** (same EDID, serial number included) are told apart by their ports, so swapping their cables while night mode is on swaps their saved levels.
 - **The figures are the maker's.** EDID luminance is what the panel was designed for, not a measurement of your unit; calibrate if it looks off.
 
 ## Development

@@ -70,6 +70,17 @@ if [[ $mon == eDP-* ]]; then              # Omarchy drives the laptop backlight 
 fi
 f="$MOCK/ddc-$mon"
 [[ -f $f ]] || exit 1                      # no DDC/CI on this monitor
+# Like Omarchy's DDC helper: a monitor that missed a read is refused for 60 s.
+mark="$XDG_RUNTIME_DIR/omarchy-brightness-display-ddc/$mon.bus"
+if [[ -f $mark ]] && read -r word _ <"$mark" && [[ $word == unavailable ]]; then exit 1; fi
+if [[ -f $MOCK/asleep-$mon ]]; then         # still waking up: misses N calls
+  n=$(<"$MOCK/asleep-$mon")
+  if (( n > 0 )); then
+    echo $(( n - 1 )) >"$MOCK/asleep-$mon"
+    mkdir -p "${mark%/*}"; echo "unavailable $(date +%s)" >"$mark"
+    exit 1
+  fi
+fi
 if [[ -n $step && -f $MOCK/drop-$mon ]]; then  # the monitor misses N writes, silently
   n=$(<"$MOCK/drop-$mon")
   if (( n > 0 )); then echo $(( n - 1 )) >"$MOCK/drop-$mon"; exit 0; fi
@@ -80,22 +91,37 @@ EOF
   export PATH="$W/bin:$PATH"
 }
 
+# monitors eDP-1 DP-2 ... ; "eDP-1:off" is a laptop panel switched off (lid closed).
 monitors() {
-  local m out=() make model
+  local m out=() make model off
   for m in "$@"; do
+    off=false
+    [[ $m == *:off ]] && { m=${m%:off}; off=true; }
     case $m in
     eDP-1) make="LG Display" model="0x07B4" ;;
     DP-2) make="Shenzhen KTC Technology Group" model="H24T27" ;;
     *) make="Generic" model="TV" ;;
     esac
-    out+=("{\"name\":\"$m\",\"make\":\"$make\",\"model\":\"$model\",\"description\":\"$make $model\",\"disabled\":false}")
+    out+=("{\"name\":\"$m\",\"make\":\"$make\",\"model\":\"$model\",\"description\":\"$make $model\",\"disabled\":$off}")
   done
   (IFS=,; echo "[${out[*]}]") >"$MOCK/monitors.json"
+}
+
+# Move a monitor to another port: its EDID and its own brightness go with it.
+move() {
+  mkdir -p "$NIGHT_MODE_SYSFS/class/drm/card1-$2"
+  mv "$NIGHT_MODE_SYSFS/class/drm/card1-$1/edid" "$NIGHT_MODE_SYSFS/class/drm/card1-$2/edid"
+  : >"$NIGHT_MODE_SYSFS/class/drm/card1-$1/edid"   # sysfs keeps an empty file
+  mv "$MOCK/ddc-$1" "$MOCK/ddc-$2"
 }
 
 laptop() { cat "$NIGHT_MODE_SYSFS/class/backlight/intel_backlight/brightness"; }
 kbd() { cat "$NIGHT_MODE_SYSFS/class/leds/dell::kbd_backlight/brightness"; }
 ddc() { cat "$MOCK/ddc-$1"; }
+# The own level saved for the screen now (or last) on a port.
+own() { jq -r --arg c "$1" '[.saved[] | select(.connector == $c)][0].level' "$NIGHT_MODE_STATE_DIR/state.json"; }
+saved_count() { jq -r '.saved | length' "$NIGHT_MODE_STATE_DIR/state.json"; }
+sync_rc() { "$NM" sync >/dev/null 2>&1; echo $?; }
 teardown() { rm -rf "$W"; }
 
 # --- tests -------------------------------------------------------------------
@@ -141,11 +167,11 @@ eq "laptop alone keeps the monitor's target" "$(laptop)" "17"
 monitors eDP-1 DP-2
 "$NM" sync >/dev/null
 eq "monitor plugged in while on is dimmed" "$(ddc DP-2)" "1"
-eq "its own level was saved" "$(jq -r '.saved["DP-2"].level' "$NIGHT_MODE_STATE_DIR/state.json")" "70"
+eq "its own level was saved" "$(own DP-2)" "70"
 monitors eDP-1
 "$NM" off >/dev/null
 eq "laptop restored with monitor away" "$(laptop)" "240"
-eq "unplugged monitor stays pending" "$(jq -r '.saved | keys | join(",")' "$NIGHT_MODE_STATE_DIR/state.json")" "DP-2"
+eq "unplugged monitor stays pending" "$(jq -r '[.saved[].connector] | join(",")' "$NIGHT_MODE_STATE_DIR/state.json")" "DP-2"
 monitors eDP-1 DP-2
 "$NM" sync >/dev/null
 eq "replugged monitor gets its brightness back" "$(ddc DP-2)" "70"
@@ -160,7 +186,7 @@ echo 100 >"$MOCK/ddc-DP-2"                 # unplugged, powers up at its own bri
 monitors eDP-1 DP-2
 "$NM" sync >/dev/null
 eq "replugged monitor is dimmed again" "$(ddc DP-2)" "1"
-eq "its own level is still the first one" "$(jq -r '.saved["DP-2"].level' "$NIGHT_MODE_STATE_DIR/state.json")" "70"
+eq "its own level is still the first one" "$(own DP-2)" "70"
 echo 1 >"$MOCK/ddc-DP-2"; echo 9 >"$NIGHT_MODE_SYSFS/class/backlight/intel_backlight/brightness"
 "$NM" sync >/dev/null
 eq "a screen you dimmed further is left alone" "$(laptop)" "9"
@@ -251,6 +277,12 @@ echo '{"bar":{"layout":{"centerEnd":[{"id":"io.github.jackrubiralta.night-mode",
 eq "a lower night level still dims further" "$(laptop)" "4"
 "$NM" off >/dev/null
 eq "off still restores the level from before night mode" "$(laptop)" "240"
+"$NM" on >/dev/null
+echo 120 >"$NIGHT_MODE_SYSFS/class/backlight/intel_backlight/brightness"   # turned up by hand
+"$NM" sync >/dev/null
+eq "a laptop turned up by hand is not dimmed again by a sync" "$(laptop)" "120"
+"$NM" off >/dev/null
+eq "off still gives its level from before night mode" "$(laptop)" "240"
 teardown
 
 echo "restores are checked"
@@ -263,9 +295,9 @@ eq "monitor back to 70 % after the retry" "$(ddc DP-2)" "70"
 echo 99 >"$MOCK/drop-DP-2"
 eq "a monitor that will not take its level keeps night mode on" "$("$NM" off 2>/dev/null)" "on"
 eq "laptop still restored meanwhile" "$(laptop)" "240"
-eq "monitor's own level kept" "$(jq -r '.saved["DP-2"].level' "$NIGHT_MODE_STATE_DIR/state.json")" "70"
+eq "monitor's own level kept" "$(own DP-2)" "70"
 eq "second miss in a row lets night mode go off" "$("$NM" toggle 2>/dev/null)" "off"
-eq "monitor's own level still kept" "$(jq -r '.saved["DP-2"].level' "$NIGHT_MODE_STATE_DIR/state.json")" "70"
+eq "monitor's own level still kept" "$(own DP-2)" "70"
 echo 0 >"$MOCK/drop-DP-2"
 "$NM" sync >/dev/null
 eq "next sync puts it back" "$(ddc DP-2)" "70"
@@ -274,6 +306,156 @@ eq "and clears it" "$(jq -c '.saved' "$NIGHT_MODE_STATE_DIR/state.json")" "{}"
 echo 2 >"$MOCK/drop-DP-2"
 "$NM" off >/dev/null 2>&1
 eq "two missed writes within one restore are still retried" "$(ddc DP-2)" "70"
+teardown
+
+echo "a screen away is treated as plugged in"
+setup
+"$NM" on >/dev/null
+monitors eDP-1                             # unplug the laptop (monitor keeps its 1 %)
+"$NM" sync >/dev/null
+"$NM" off >/dev/null                       # undim on the laptop alone
+eq "laptop restored on its own" "$(laptop)" "240"
+eq "monitor's own level kept while it is away" "$(own DP-2)" "70"
+monitors eDP-1 DP-2                        # plug back in: still at 1 %, slow to wake
+echo 6 >"$MOCK/asleep-DP-2"
+eq "sync says try again while the monitor does not answer" "$(sync_rc)" "75"
+eq "monitor not answering yet, still saved" "$(own DP-2)" "70"
+eq "sync after it wakes" "$(sync_rc)" "0"
+eq "monitor gets its own level back" "$(ddc DP-2)" "70"
+eq "nothing left saved" "$(saved_count)" "0"
+teardown
+
+setup
+"$NM" on >/dev/null; monitors eDP-1; "$NM" off >/dev/null
+monitors eDP-1 DP-2
+mkdir -p "$XDG_RUNTIME_DIR/omarchy-brightness-display-ddc"
+echo "unavailable $(date +%s)" >"$XDG_RUNTIME_DIR/omarchy-brightness-display-ddc/DP-2.bus"
+echo 1 >"$MOCK/asleep-DP-2"
+eq "Omarchy's 60 s 'unavailable' mark does not block a monitor that answered before" "$(sync_rc)" "0"
+eq "and it is restored" "$(ddc DP-2)" "70"
+teardown
+
+setup
+"$NM" on >/dev/null; monitors eDP-1; "$NM" off >/dev/null
+"$NM" on >/dev/null; "$NM" off >/dev/null  # on and off again while it is away
+monitors eDP-1 DP-2
+"$NM" sync >/dev/null
+eq "still its own level from before, after more on/off while away" "$(ddc DP-2)" "70"
+teardown
+
+setup
+"$NM" on >/dev/null; monitors eDP-1; "$NM" off >/dev/null
+"$NM" on >/dev/null                        # night mode on again before it comes back
+monitors eDP-1 DP-2
+"$NM" sync >/dev/null
+eq "back while on: stays dimmed" "$(ddc DP-2)" "1"
+"$NM" off >/dev/null
+eq "then off gives the level from before it left" "$(ddc DP-2)" "70"
+teardown
+
+echo "a screen on another port"
+setup
+"$NM" on >/dev/null
+monitors eDP-1; "$NM" sync >/dev/null; "$NM" off >/dev/null
+move DP-2 DP-1                             # plugged into the other USB-C port
+monitors eDP-1 DP-1
+"$NM" sync >/dev/null
+eq "same monitor on another port gets its own level back" "$(ddc DP-1)" "70"
+eq "nothing left saved" "$(saved_count)" "0"
+teardown
+
+setup
+"$NM" on >/dev/null
+monitors eDP-1; "$NM" sync >/dev/null
+move DP-2 DP-1
+monitors eDP-1 DP-1
+"$NM" sync >/dev/null
+eq "on another port while on: stays dimmed" "$(ddc DP-1)" "1"
+eq "its own level is not taken from the dimmed one" "$(own DP-1)" "70"
+"$NM" off >/dev/null
+eq "off gives it 70 % on the new port" "$(ddc DP-1)" "70"
+teardown
+
+setup
+"$NM" on >/dev/null
+monitors eDP-1; "$NM" off >/dev/null       # monitor away, its restore pending
+move DP-2 DP-1                             # park the monitor; a TV takes its port
+cp "$NIGHT_MODE_SYSFS/class/drm/card1-HDMI-A-1/edid" "$NIGHT_MODE_SYSFS/class/drm/card1-DP-2/edid"
+echo 55 >"$MOCK/ddc-DP-2"
+monitors eDP-1 DP-2
+"$NM" sync >/dev/null
+eq "another screen on that port is left alone" "$(ddc DP-2)" "55"
+eq "the monitor's own level is still kept" "$(own DP-2)" "70"
+mv "$MOCK/ddc-DP-1" "$MOCK/ddc-DP-2"
+cp "$NIGHT_MODE_SYSFS/class/drm/card1-DP-1/edid" "$NIGHT_MODE_SYSFS/class/drm/card1-DP-2/edid"
+monitors eDP-1 DP-2
+"$NM" sync >/dev/null
+eq "the monitor back on its port gets its level" "$(ddc DP-2)" "70"
+teardown
+
+echo "state from 1.1"
+setup
+mkdir -p "$NIGHT_MODE_STATE_DIR"
+echo 1 >"$MOCK/ddc-DP-2"
+echo '{"on":false,"saved":{"DP-2":{"key":"4d67102401000000","kind":"percent","device":"","level":70,"setLevel":1}},"displays":{}}' \
+  >"$NIGHT_MODE_STATE_DIR/state.json"
+move DP-2 DP-1
+monitors eDP-1 DP-1
+"$NM" sync >/dev/null
+eq "a 1.1 entry filed under its old port finds the monitor" "$(ddc DP-1)" "70"
+eq "and is cleared" "$(saved_count)" "0"
+teardown
+
+echo "a monitor that misses a read"
+setup
+"$NM" on >/dev/null
+echo 3 >"$MOCK/asleep-DP-2"
+eq "sync asks to try again" "$(sync_rc)" "75"
+eq "laptop keeps the monitor-matched level (no darker target)" "$(laptop)" "17"
+eq "monitor still counts as controllable" "$(jq -r '.displays["4d67102401000000"].controllable' "$NIGHT_MODE_STATE_DIR/state.json")" "true"
+teardown
+
+setup
+"$NM" on >/dev/null
+monitors eDP-1
+echo 100 >"$MOCK/ddc-DP-2"; echo 1 >"$MOCK/asleep-DP-2"
+monitors eDP-1 DP-2                        # comes back bright and slow
+eq "bright and not answering: try again" "$(sync_rc)" "75"
+"$NM" sync >/dev/null
+eq "dimmed once it answers" "$(ddc DP-2)" "1"
+teardown
+
+echo "lid closed"
+setup
+"$NM" on >/dev/null
+monitors eDP-1:off DP-2                    # lid closed, laptop panel switched off
+"$NM" off >/dev/null
+eq "laptop backlight restored with the lid closed" "$(laptop)" "240"
+eq "monitor restored" "$(ddc DP-2)" "70"
+"$NM" on >/dev/null
+eq "laptop dimmed with the lid closed, ready for when it opens" "$(laptop)" "17"
+teardown
+
+echo "two identical monitors"
+setup
+mkdir -p "$NIGHT_MODE_SYSFS/class/drm/card1-DP-1"
+cp "$FIX/ktc-h24t27.edid" "$NIGHT_MODE_SYSFS/class/drm/card1-DP-1/edid"
+echo 40 >"$MOCK/ddc-DP-1"
+monitors eDP-1 DP-1 DP-2
+"$NM" on >/dev/null
+eq "first dimmed" "$(ddc DP-1)" "1"
+eq "second dimmed" "$(ddc DP-2)" "1"
+"$NM" off >/dev/null
+eq "first back to its own 40 %" "$(ddc DP-1)" "40"
+eq "second back to its own 70 %" "$(ddc DP-2)" "70"
+teardown
+
+echo "syncs asked at once"
+setup
+"$NM" on >/dev/null
+monitors eDP-1
+"$NM" sync >/dev/null & "$NM" sync >/dev/null & wait
+eq "both finish and the laptop is right" "$(laptop)" "17"
 teardown
 
 echo "info"
